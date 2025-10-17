@@ -1,0 +1,11 @@
+[project]
+name = "angst"
+version = "0.1.0"
+description = "Iterative rule improvement system with modular architecture"
+authors = [{name = "Cursor AI", email = "devnull@example.com"}]
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
