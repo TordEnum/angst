@@ -1,0 +1,18 @@
+{
+  "axioms": [
+    "before declare_intent external_call",
+    "before commit verify_patch_proof",
+    "compress_redundant_rules",
+    "intent Create an agent that reads a file and summarizes it",
+    "fn sum_list(arr:List[int])->int",
+    "constraint must be efficient over 10^5 inputs",
+    "perf prefer O(n) or better, avoid quadratic loops compress",
+    "safety no networking verify",
+    "safety no subprocess",
+    "safety pure function preferred"
+  ],
+  "code_sha": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+  "policy_sha": "e669d76a8ae5c02d2542f22f73e89efb38b802b39360452cbe3c8850fe7ced90",
+  "seed": 211350776,
+  "tests_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

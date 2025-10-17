@@ -550,6 +550,159 @@ class SemanticExtractor:
         return axioms
 
 # =====================
+# Tools and Kernel (Modular Tool System)
+# =====================
+
+
+@dataclass
+class ToolSpec:
+    name: str
+    description: str
+    code: str  # Python code implementing the tool
+    tests: List[str]
+    cost: float
+
+
+class ToolRegistry:
+    def __init__(self, ledger: Ledger):
+        self.ledger = ledger
+        self._tools: Dict[str, ToolSpec] = {}
+
+    def register(self, tool: ToolSpec) -> None:
+        self._tools[tool.name] = tool
+        self.ledger.append({"event": "tool_registered", "tool": tool.name, "cost": tool.cost})
+
+    def get(self, name: str) -> Optional[ToolSpec]:
+        return self._tools.get(name)
+
+    def list_tools(self) -> List[str]:
+        return sorted(self._tools.keys())
+
+    def suggest_for_spec(self, spec: RequirementsSpec) -> List[ToolSpec]:
+        # Heuristic: map by function names
+        out: List[ToolSpec] = []
+        for f in spec.functions:
+            if f.name in self._tools:
+                out.append(self._tools[f.name])
+        return out
+
+
+# =====================
+# Meta DSL (MetaLang) - Rust/C++/Python-inspired
+# =====================
+
+
+class MetaLangError(Exception):
+    pass
+
+
+class MetaLang:
+    """Tiny multi-paradigm DSL:
+
+    Syntax subset:
+      fn name(args) -> type {
+        let mut x: T = expr;
+        for i in 0..n { ... }
+        return expr;
+      }
+
+    Transpiles to Python.
+    """
+
+    @staticmethod
+    def to_python(src: str) -> str:
+        src = src.strip()
+        m = re.match(r"fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\(([^)]*)\)\s*->\s*([^\s{]+)\s*\{([\s\S]*)\}$", src)
+        if not m:
+            raise MetaLangError("Invalid MetaLang function")
+        name, args_part, ret, body = m.group(1), m.group(2), m.group(3), m.group(4)
+        py_lines: List[str] = [f"def {name}({MetaLang._py_args(args_part)}):"]
+        for line in MetaLang._split_lines(body):
+            if not line:
+                continue
+            py_lines.extend(["    " + l for l in MetaLang._compile_line(line)])
+        if len(py_lines) == 1:
+            py_lines.append("    pass")
+        return "\n".join(py_lines) + "\n"
+
+    @staticmethod
+    def _py_args(args_part: str) -> str:
+        args_part = args_part.strip()
+        if not args_part:
+            return ""
+        # keep python-like annotations where possible: x: int -> x: int
+        args = [a.strip() for a in args_part.split(",") if a.strip()]
+        return ", ".join(args)
+
+    @staticmethod
+    def _split_lines(body: str) -> List[str]:
+        # Remove braces and split by semicolons/newlines
+        text = body.replace("\n", "\n").strip()
+        # Balance braces not supported beyond top-level
+        lines = []
+        buf = ""
+        for ch in text:
+            if ch == ';':
+                lines.append(buf.strip())
+                buf = ""
+            else:
+                buf += ch
+        if buf.strip():
+            lines.append(buf.strip())
+        return [ln for ln in (ln.strip() for ln in lines) if ln]
+
+    @staticmethod
+    def _compile_line(line: str) -> List[str]:
+        line = line.strip()
+        # let mut or let declarations
+        m = re.match(r"let\s+(?:mut\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*:(?:[^=]+)=\s*(.*)$", line)
+        if m:
+            name, expr = m.group(1), m.group(2)
+            return [f"{name} = {expr}"]
+        # for loops: for i in 0..n { ... } -> simple range
+        m = re.match(r"for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+in\s+0\.\.(\w+)\s*\{\s*([^}]*)\s*\}$", line)
+        if m:
+            var, end, inner = m.group(1), m.group(2), m.group(3)
+            inner_lines = ["    " + l for l in MetaLang._compile_line(inner)] if inner else ["    pass"]
+            return [f"for {var} in range({end}):"] + inner_lines
+        if line.startswith("return "):
+            return [line]
+        # default: passthrough python expr
+        return [line]
+
+
+# =====================
+# Reasoning Graph and Reflection Recorder
+# =====================
+
+
+class GraphRecorder:
+    def __init__(self, ledger: Ledger):
+        self.ledger = ledger
+        self.nodes: Dict[str, Dict[str, Any]] = {}
+        self.edges: List[Tuple[str, str, str]] = []  # (src, dst, label)
+
+    def add_node(self, nid: str, kind: str, attrs: Dict[str, Any]) -> None:
+        self.nodes[nid] = {"kind": kind, **attrs}
+
+    def add_edge(self, src: str, dst: str, label: str) -> None:
+        self.edges.append((src, dst, label))
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {"nodes": self.nodes, "edges": self.edges}
+
+    def persist(self) -> None:
+        gid = stable_hash("graph", str(int(now_ts())))
+        self.ledger.write_artifact("graphs", gid, self.snapshot(), immutable=False)
+
+
+class ReflectionRecorder:
+    def __init__(self, ledger: Ledger):
+        self.ledger = ledger
+
+    def record(self, reason: str, context: Dict[str, Any]) -> None:
+        self.ledger.append({"event": "reflection", "reason": reason, "context": context})
+# =====================
 # PHRE + RSL
 # =====================
 
@@ -1184,6 +1337,25 @@ class SelfRefiner:
 
 
 # =====================
+# Intelligence Scoring Layer
+# =====================
+
+
+class IntelligenceScorer:
+    @staticmethod
+    def score(ci_report: Dict[str, Any], kg_size: int, diversity: float) -> Dict[str, float]:
+        ci_ok = 1.0 if ci_report.get("ok") else 0.0
+        coverage = float(ci_report.get("coverage_ratio", 0.0))
+        structural = min(1.0, math.log2(max(2, kg_size)) / 10.0)
+        reasoning = min(1.0, diversity)
+        return {
+            "ci_score": 0.5 * ci_ok + 0.5 * coverage,
+            "structural_score": structural,
+            "reasoning_depth": reasoning,
+        }
+
+
+# =====================
 # Meta Review Board & Deployment
 # =====================
 
@@ -1276,6 +1448,9 @@ class FrontendAI:
         self.review_board = ReviewBoard()
         self.deployer = Deployer(cfg, self.ledger)
         self.refiner = SelfRefiner(cfg, self.ledger)
+        self.tools = ToolRegistry(self.ledger)
+        self.graph = GraphRecorder(self.ledger)
+        self.reflect = ReflectionRecorder(self.ledger)
         self.seed_initial_rules()
         self.frozen = False
 
@@ -1391,13 +1566,20 @@ class FrontendAI:
         return materialized_ids
 
     def run_once(self, prompt: str) -> Dict[str, Any]:
-        base_axioms = [r.pattern for r in self.kg.all_rules()]
+        # Semantic extraction and tool suggestion
+        spec = SemanticExtractor.parse_prompt(prompt)
+        axioms_from_spec = SemanticExtractor.spec_to_axioms(spec)
+        base_axioms = [r.pattern for r in self.kg.all_rules()] + axioms_from_spec
+        self.graph.add_node(stable_hash("prompt", prompt), "prompt", {"text": prompt})
         variants = self.propose_code_variants(base_axioms, n_variants=self.cfg.variants_per_round)
         top = self.rsl.evaluate_variants(variants, steps=self.cfg.sim_steps, topk=self.cfg.topk_variants)
         proposals = self.build_and_verify_proposals(prompt, top)
         mat_ids = self.materialize(proposals)
         comp = self.kg.compress(threshold=self.cfg.compress_threshold, levels=self.cfg.hierarchical_levels)
         checks_info = self.checks.strengthen_checks([r.pattern for r in self.kg.all_rules()])
+        # Intelligence scoring
+        any_ci = next((p.ci_report for p in proposals if p.ci_report), {})
+        intel = IntelligenceScorer.score(any_ci, len(self.kg.all_rules()), self.rsl.last_diversity)
         entry = {
             "iteration": 0,
             "top_variants": [{"seed": t["variant"]["seed"], "score": t["sim"]["score"], "axioms": t["variant"]["axioms"]} for t in top],
@@ -1406,6 +1588,7 @@ class FrontendAI:
             "compression": comp,
             "checks": checks_info[:5],
             "kg_size": len(self.kg.all_rules()),
+            "scores": intel,
         }
         self.ledger.append(entry)
         return entry
@@ -1417,13 +1600,18 @@ class FrontendAI:
         for it in range(self.cfg.iterations):
             if self.frozen:
                 break
-            base_axioms = [r.pattern for r in self.kg.all_rules()]
+            # Build spec and axioms
+            spec = SemanticExtractor.parse_prompt(prompt)
+            axioms_from_spec = SemanticExtractor.spec_to_axioms(spec)
+            base_axioms = [r.pattern for r in self.kg.all_rules()] + axioms_from_spec
             variants = self.rsl.propose_variants(base_axioms, n=self.cfg.variants_per_round)
             top = self.rsl.evaluate_variants(variants, steps=self.cfg.sim_steps, topk=self.cfg.topk_variants)
             proposals = self.build_and_verify_proposals(prompt, top)
             mat_ids = self.materialize(proposals)
             comp = self.kg.compress(threshold=self.cfg.compress_threshold, levels=self.cfg.hierarchical_levels)
             checks_info = self.checks.strengthen_checks([r.pattern for r in self.kg.all_rules()])
+            any_ci = next((p.ci_report for p in proposals if p.ci_report), {})
+            intel = IntelligenceScorer.score(any_ci, len(self.kg.all_rules()), self.rsl.last_diversity)
 
             best_score = max((t["sim"]["score"] for t in top), default=0.0)
             if best_score < last_best_score * 0.98:
@@ -1444,6 +1632,7 @@ class FrontendAI:
                 "compression": comp,
                 "checks": checks_info[:5],
                 "kg_size": len(self.kg.all_rules()),
+                "scores": intel,
             }
             self.ledger.append(entry)
 
