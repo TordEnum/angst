@@ -452,6 +452,104 @@ class MiniLang:
 
 
 # =====================
+# Requirements Spec and Semantic Extraction
+# =====================
+
+
+@dataclass
+class FunctionSpec:
+    name: str
+    args: List[Tuple[str, str]]  # (name, type)
+    returns: str
+
+
+@dataclass
+class RequirementsSpec:
+    intent: str
+    functions: List[FunctionSpec]
+    constraints: List[str]
+    examples: List[Tuple[Any, Any]]
+    performance_goals: List[str]
+    safety_requirements: List[str]
+    notes: Dict[str, Any]
+
+
+class SemanticExtractor:
+    KEYWORDS = {
+        "reverse": ("reverse_string", [("s", "str")], "str"),
+        "sort": ("sort_list", [("arr", "List[int]")], "List[int]"),
+        "sum": ("sum_list", [("arr", "List[int]")], "int"),
+    }
+
+    @staticmethod
+    def parse_prompt(prompt: str) -> RequirementsSpec:
+        text = (prompt or "").strip()
+        lowered = text.lower()
+        functions: List[FunctionSpec] = []
+        constraints: List[str] = []
+        examples: List[Tuple[Any, Any]] = []
+        performance_goals: List[str] = []
+        safety_requirements: List[str] = [
+            "no networking", "no subprocess", "pure function preferred",
+        ]
+        notes: Dict[str, Any] = {}
+
+        # Simple intent
+        intent = text.split(".")[0].strip()
+
+        # Detect functions
+        for kw, (fname, args, ret) in SemanticExtractor.KEYWORDS.items():
+            if kw in lowered:
+                functions.append(FunctionSpec(fname, args, ret))
+
+        # Defaults when none detected
+        if not functions:
+            # fall back to generic function
+            functions.append(FunctionSpec("generated_function", [("x", "Any")], "Any"))
+
+        # Constraints and perf goals heuristics
+        if "optimize" in lowered or "fast" in lowered or "speed" in lowered:
+            performance_goals.append("prefer O(n) or better, avoid quadratic loops")
+            constraints.append("must be efficient over 10^5 inputs")
+
+        if "memory" in lowered:
+            performance_goals.append("low memory footprint")
+            constraints.append("no unnecessary copies")
+
+        # Examples for reverse
+        if any(f.name == "reverse_string" for f in functions):
+            examples.extend([
+                ("racecar", "racecar"),
+                ("abcdef", "fedcba"),
+            ])
+
+        notes["tokens"] = re.findall(r"[a-zA-Z_]+", lowered)
+        return RequirementsSpec(
+            intent=intent,
+            functions=functions,
+            constraints=constraints,
+            examples=examples,
+            performance_goals=performance_goals,
+            safety_requirements=safety_requirements,
+            notes=notes,
+        )
+
+    @staticmethod
+    def spec_to_axioms(spec: RequirementsSpec) -> List[str]:
+        axioms: List[str] = []
+        axioms.append(f"intent {spec.intent}")
+        for f in spec.functions:
+            arg_sig = ",".join(f"{n}:{t}" for n, t in f.args)
+            axioms.append(f"fn {f.name}({arg_sig})->{f.returns}")
+        for c in spec.constraints:
+            axioms.append(f"constraint {c}")
+        for p in spec.performance_goals:
+            axioms.append(f"perf {p}")
+        for s in spec.safety_requirements:
+            axioms.append(f"safety {s}")
+        return axioms
+
+# =====================
 # PHRE + RSL
 # =====================
 
@@ -756,6 +854,17 @@ try:
 except Exception:
     pass
 
+# Restrict open to read-only inside CWD and deny writes by default
+_real_open = open
+def open(file, mode='r', *args, **kwargs):
+    if any(m in mode for m in ['w', 'a', '+']):
+        raise RuntimeError('File write denied by policy')
+    # restrict to cwd
+    file = os.path.abspath(file)
+    if not file.startswith(os.getcwd()):
+        raise RuntimeError('Access outside sandbox denied')
+    return _real_open(file, mode, *args, **kwargs)
+
 import io
 _stdout_cap = __STDOUT_CAP__
 _stdout_buf = io.StringIO()
@@ -1026,6 +1135,55 @@ class CI:
 
 
 # =====================
+# Self-Refinement and Constraint Learning
+# =====================
+
+
+class ConstraintLearner:
+    """Learns additional constraints and tests from failures and policy triggers."""
+
+    @staticmethod
+    def learn_from_reports(ci_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
+        new_policy_entries: List[str] = []
+        new_tests: List[str] = []
+        for r in ci_reports:
+            issues = r.get("issues") or []
+            for iss in issues:
+                if "Denied import" in iss or "Denied dynamic import" in iss:
+                    new_policy_entries.append("deny import socket, subprocess")
+        # Deduplicate
+        new_policy_entries = sorted(set(new_policy_entries))
+        return {"policy_add": new_policy_entries, "tests_add": new_tests}
+
+
+class SelfRefiner:
+    def __init__(self, cfg: Config, ledger: Ledger):
+        self.cfg = cfg
+        self.ledger = ledger
+
+    def refine(self) -> Dict[str, Any]:
+        # Load recent CI reports from artifacts dir if present
+        ci_dir = Path(self.ledger.root) / "ci_reports"
+        reports: List[Dict[str, Any]] = []
+        if ci_dir.exists():
+            for p in sorted(ci_dir.glob("*.json"))[-50:]:
+                try:
+                    reports.append(json.loads(p.read_text(encoding="utf8")))
+                except Exception:
+                    continue
+        learn = ConstraintLearner.learn_from_reports(reports)
+        updates: Dict[str, Any] = {}
+        if learn.get("policy_add"):
+            # Append to default policy
+            add = "\n".join(learn["policy_add"]) + "\n"
+            self.cfg.default_policy += add
+            updates["policy_appended"] = learn["policy_add"]
+        if updates:
+            self.ledger.append({"event": "self_refine", **updates})
+        return updates
+
+
+# =====================
 # Meta Review Board & Deployment
 # =====================
 
@@ -1117,6 +1275,7 @@ class FrontendAI:
         self.signer = Signer(Path(cfg.out_dir) / "signing.key")
         self.review_board = ReviewBoard()
         self.deployer = Deployer(cfg, self.ledger)
+        self.refiner = SelfRefiner(cfg, self.ledger)
         self.seed_initial_rules()
         self.frozen = False
 
@@ -1128,8 +1287,9 @@ class FrontendAI:
 
     # Step 1: Take a user prompt and convert to initial axioms
     def prompt_to_axioms(self, prompt: str) -> List[str]:
-        sents = [p.strip() for p in re.split(r"[\.;\n]+", prompt) if p.strip()]
-        axioms = sents
+        # Advanced: semantic extraction to axioms
+        spec = SemanticExtractor.parse_prompt(prompt)
+        axioms = SemanticExtractor.spec_to_axioms(spec)
         return axioms
 
     # Step 2: Propose code variants from axioms
@@ -1298,6 +1458,9 @@ class FrontendAI:
             if it % 2 == 1:
                 self.run_red_team()
 
+            # Self-refinement pass
+            self.refiner.refine()
+
         agg = self.ledger.aggregate_metrics()
         self.ledger.append({"summary": agg})
         self.ledger.backup_immutable()
@@ -1346,6 +1509,11 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
 
     p_red = sub.add_parser("redteam", help="Run red-team prompts")
 
+    p_refine = sub.add_parser("refine", help="Run self-refinement based on telemetry and CI reports")
+
+    p_explain = sub.add_parser("explain", help="Explain semantic extraction of a prompt")
+    p_explain.add_argument("--prompt", type=str, required=True)
+
     args = parser.parse_args(argv)
     cfg = dataclasses.replace(DEFAULT_CONFIG, allow_auto_approve=bool(getattr(args, "auto_approve", False)))
 
@@ -1361,6 +1529,13 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
     elif args.cmd == "redteam":
         out = frontend.run_red_team()
         print(json.dumps(out, indent=2))
+    elif args.cmd == "refine":
+        out = frontend.refiner.refine()
+        print(json.dumps(out, indent=2))
+    elif args.cmd == "explain":
+        spec = SemanticExtractor.parse_prompt(args.prompt)
+        axioms = SemanticExtractor.spec_to_axioms(spec)
+        print(json.dumps(dataclasses.asdict(spec) | {"axioms": axioms}, indent=2))
     else:
         parser.error("Unknown command")
     print("Done. Ledger at:", f"{cfg.out_dir}/{cfg.ledger_file}")
