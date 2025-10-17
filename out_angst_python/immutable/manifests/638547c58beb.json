@@ -1,0 +1,11 @@
+{
+  "axioms": [
+    "before declare_intent external_call",
+    "before commit verify_patch_proof",
+    "compress_redundant_rules"
+  ],
+  "code_sha": "b4c5a522edc123326a23451830c40604802164502e021809054e914db812ca0b",
+  "policy_sha": "e669d76a8ae5c02d2542f22f73e89efb38b802b39360452cbe3c8850fe7ced90",
+  "seed": 53710185,
+  "tests_sha": "d672d2a411a5ef82b84e5c161787fd74bc6a5fa92ae4ec61a187ca710594728a"
+}
