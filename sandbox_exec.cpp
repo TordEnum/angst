@@ -7,7 +7,10 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <time.h>
+#ifdef __linux__
 #include <sys/prctl.h>
+#endif
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -73,8 +76,10 @@ int main(int argc, char** argv){
         rl.rlim_cur = rl.rlim_max = (rlim_t) mem_bytes; setrlimit(RLIMIT_AS, &rl);
         rl.rlim_cur = rl.rlim_max = (rlim_t) 1024*1024; setrlimit(RLIMIT_FSIZE, &rl);
         rl.rlim_cur = rl.rlim_max = (rlim_t) 256; setrlimit(RLIMIT_NOFILE, &rl);
+#ifdef __linux__
 #ifdef PR_SET_NO_NEW_PRIVS
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+#endif
 #endif
         // redirect stdio
         dup2(out_pipe[1], STDOUT_FILENO);
