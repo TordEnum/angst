@@ -19,4 +19,26 @@ class Config:
     ledger_file: str = "ledger.jsonl"
     seed: int = 42
 
+    # Causal modeler
+    causal_max_degree: int = 2
+    causal_learning_rate: float = 0.05
+    causal_steps: int = 200
+
+    # Quantum-inspired reasoning
+    quantum_samples: int = 64
+    quantum_temperature: float = 1.0
+    enable_quantum: bool = True
+
+    # Hardware co-design
+    hdl_sim_steps: int = 32
+
+    # Federation / distributed intelligence
+    federation_nodes: int = 3
+
+    # Monitoring / convergence
+    monitor_patience: int = 3
+
+    # Cryptographic ledger
+    chain_enable: bool = True
+
 DEFAULT_CONFIG = Config()
