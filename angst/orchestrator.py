@@ -7,6 +7,7 @@ from .checks import Checks
 from .logging_utils import Ledger
 from dataclasses import dataclass
 from typing import Tuple
+import base64, json, subprocess, shutil
 
 
 # ---- Causal Modeler (symbolic regression via simple basis expansion + SGD) ----
@@ -191,6 +192,16 @@ class Orchestrator:
         self.kg.add_rule("declare_intent before external_call", weight=1.0, seed=42)
         self.kg.add_rule("verify_patch_proof before commit", weight=1.2, seed=43)
         self.kg.add_rule("compress_redundant_rules", weight=0.8, seed=44)
+        # Example: run a trivial sandboxed Python snippet via Rust CLI if available
+        # This wires the pipeline to the Rust sandbox without enforcing it for all flows.
+        rs = shutil.which("./sandbox_runner") or shutil.which("sandbox_runner")
+        if rs:
+            code = "print('hello from sandbox')"
+            b = base64.b64encode(code.encode()).decode()
+            try:
+                _ = subprocess.check_output([rs, "run", "2", "1024", b], text=True)
+            except Exception:
+                pass
 
     def run(self) -> None:
         self.seed()
@@ -217,7 +228,24 @@ class Orchestrator:
             # Federated exchange: enrich ruleset from peers and feed back as axioms
             peer_rules = self.federation.exchange([r.pattern for r in self.kg.all_rules()])
             base_axioms = base_axioms + peer_rules[: max(0, 4 - (len(base_axioms) % 4))]
-            evald = self.rsl.evaluate_variants(variants, steps=self.cfg.sim_steps, topk=self.cfg.topk_variants)
+            # Delegate PHRE scoring to C++ sim if available
+            cpp = shutil.which("./sim_core") or shutil.which("sim_core")
+            if cpp:
+                evald: List[Dict[str, Any]] = []
+                for v in self.rsl.propose_variants(base_axioms, n=self.cfg.topk_variants * 2):
+                    lens = [str(max(1, len(a))) for a in v["axioms"]]
+                    cmd = [cpp, "phre", str(self.cfg.sim_steps), str(v["seed"]) ] + lens
+                    try:
+                        out = subprocess.check_output(cmd, text=True).strip()
+                        obj = json.loads(out)
+                        sim = {"seed": v["seed"], "trace": [], "score": float(obj.get("score", 0.0))}
+                    except Exception:
+                        sim = {"seed": v["seed"], "trace": [], "score": 0.0}
+                    evald.append({"variant": v, "sim": sim, "score_adj": sim["score"]})
+                evald.sort(key=lambda x: x["score_adj"], reverse=True)
+                evald = evald[: self.cfg.topk_variants]
+            else:
+                evald = self.rsl.evaluate_variants(variants, steps=self.cfg.sim_steps, topk=self.cfg.topk_variants)
 
             # Optional quantum collapse to pick a champion among top
             if self.cfg.enable_quantum:
@@ -238,7 +266,17 @@ class Orchestrator:
 
             # Hardware co-design: compile and simulate a tiny circuit from axiom tokens
             circ = self.hdl.compile_from_tokens(list(set(" ".join(base_axioms).split())))
-            hdl_metrics = self.hdl.simulate(circ, steps=self.cfg.hdl_sim_steps)
+            cpp = shutil.which("./sim_core") or shutil.which("sim_core")
+            if cpp:
+                tokens = list(set(" ".join(base_axioms).split()))
+                cmd = [cpp, "hdl", str(self.cfg.hdl_sim_steps)] + tokens
+                try:
+                    out = subprocess.check_output(cmd, text=True).strip()
+                    hdl_metrics = json.loads(out)
+                except Exception:
+                    hdl_metrics = self.hdl.simulate(circ, steps=self.cfg.hdl_sim_steps)
+            else:
+                hdl_metrics = self.hdl.simulate(circ, steps=self.cfg.hdl_sim_steps)
 
             # Targeted improvement: if compression has plateaued, emphasize checks
             comp = self.kg.compress(threshold=self.cfg.compress_threshold, levels=self.cfg.hierarchical_levels)
