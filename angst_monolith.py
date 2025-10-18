@@ -95,6 +95,20 @@ class Config:
     # Deployment
     canary_fraction: float = 0.1
 
+    # Meta-scoring weights
+    meta_alpha: float = 0.6   # weight for simulation score_adj
+    meta_beta: float = 0.2    # weight for predicted compression efficiency
+    meta_gamma: float = 0.15  # weight for rule/axiom diversity
+    meta_delta: float = 0.05  # weight for anomaly reduction
+
+    # Self-refine
+    refine_step: float = 0.05
+    compress_eff_window: int = 10
+    use_forecasting: bool = True
+
+    # Swarm
+    swarm_nodes: int = 3
+
 
 DEFAULT_CONFIG = Config()
 
@@ -789,10 +803,19 @@ class RSL:
             for v, fut in zip(variants, futures):
                 sim = fut.result()
                 results.append({"variant": v, "sim": sim})
+        # Adaptive meta-scoring influences ranking and selection
         for r in results:
-            r["score_adj"] = r["sim"]["score"] * self.cfg.exploitation_weight + random.random() * self.exploration_epsilon
+            base = r["sim"]["score"]
+            diversity_bonus = self.last_diversity
+            r["score_adj"] = base * self.cfg.exploitation_weight + random.random() * self.exploration_epsilon + 0.1 * diversity_bonus
         results.sort(key=lambda x: x["score_adj"], reverse=True)
-        return results[:topk]
+        selected = results[:topk]
+        # Bias seed/axiom mutation using meta-scores: move exploration eps toward better variants
+        if selected:
+            avg_adj = sum(r["score_adj"] for r in selected) / len(selected)
+            # Simple reinforcement: if avg improves, reduce exploration slightly
+            self.exploration_epsilon = max(0.05, min(0.6, self.exploration_epsilon * (0.98 if avg_adj > 1.0 else 1.01)))
+        return selected
 
 
 # =====================
@@ -1314,6 +1337,26 @@ class SelfRefiner:
         self.cfg = cfg
         self.ledger = ledger
 
+    def _moving_avg(self, values: List[float], window: int) -> float:
+        if not values:
+            return 0.0
+        w = max(1, min(window, len(values)))
+        return sum(values[-w:]) / w
+
+    def _forecast_next(self, xs: List[int], ys: List[float]) -> float:
+        # Simple linear regression y = a*x + b, predict next x
+        if len(xs) < 2 or not self.cfg.use_forecasting:
+            return ys[-1] if ys else 0.0
+        n = len(xs)
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+        den = sum((x - mean_x) ** 2 for x in xs) or 1.0
+        a = num / den
+        b = mean_y - a * mean_x
+        next_x = xs[-1] + 1
+        return a * next_x + b
+
     def refine(self) -> Dict[str, Any]:
         # Load recent CI reports from artifacts dir if present
         ci_dir = Path(self.ledger.root) / "ci_reports"
@@ -1331,6 +1374,47 @@ class SelfRefiner:
             add = "\n".join(learn["policy_add"]) + "\n"
             self.cfg.default_policy += add
             updates["policy_appended"] = learn["policy_add"]
+
+        # Analyze ledger for compression efficiency and anomalies
+        eff_vals: List[float] = []
+        anomalies: List[float] = []
+        xs: List[int] = []
+        try:
+            with open(self.ledger.path, "r", encoding="utf8") as f:
+                for line in f:
+                    obj = json.loads(line)
+                    it = obj.get("iteration")
+                    comp = obj.get("compression", {})
+                    eff = comp.get("efficiency_score")
+                    if it is not None and isinstance(eff, (int, float)):
+                        xs.append(int(it))
+                        eff_vals.append(float(eff))
+                    if obj.get("event") == "freeze_trigger":
+                        anomalies.append(1.0)
+        except Exception:
+            pass
+
+        if eff_vals:
+            ma = self._moving_avg(eff_vals, self.cfg.compress_eff_window)
+            last = eff_vals[-1]
+            forecast = self._forecast_next(xs, eff_vals)
+            # If dropping vs moving avg, adjust compress threshold
+            if last < ma:
+                self.cfg.compress_threshold = min(0.95, self.cfg.compress_threshold + self.cfg.refine_step)
+                updates["compress_threshold"] = self.cfg.compress_threshold
+            elif last > ma + 0.02:
+                self.cfg.compress_threshold = max(0.3, self.cfg.compress_threshold - self.cfg.refine_step)
+                updates["compress_threshold"] = self.cfg.compress_threshold
+            # Adjust exploration based on forecast
+            if forecast < last:
+                self.cfg.exploration_epsilon = min(0.6, self.cfg.exploration_epsilon + 0.02)
+                updates["exploration_epsilon"] = self.cfg.exploration_epsilon
+            else:
+                self.cfg.exploration_epsilon = max(0.05, self.cfg.exploration_epsilon - 0.01)
+                updates["exploration_epsilon"] = self.cfg.exploration_epsilon
+
+        if updates:
+            self.ledger.append({"event": "self_refine", **updates})
         if updates:
             self.ledger.append({"event": "self_refine", **updates})
         return updates
@@ -1343,16 +1427,19 @@ class SelfRefiner:
 
 class IntelligenceScorer:
     @staticmethod
-    def score(ci_report: Dict[str, Any], kg_size: int, diversity: float) -> Dict[str, float]:
+    def score(ci_report: Dict[str, Any], kg_size: int, diversity: float, comp_eff: float, anomaly_delta: float, cfg: Config = DEFAULT_CONFIG) -> Dict[str, float]:
         ci_ok = 1.0 if ci_report.get("ok") else 0.0
         coverage = float(ci_report.get("coverage_ratio", 0.0))
         structural = min(1.0, math.log2(max(2, kg_size)) / 10.0)
         reasoning = min(1.0, diversity)
-        return {
-            "ci_score": 0.5 * ci_ok + 0.5 * coverage,
-            "structural_score": structural,
-            "reasoning_depth": reasoning,
-        }
+        ci_score = 0.5 * ci_ok + 0.5 * coverage
+        meta = (
+            cfg.meta_alpha * ci_score
+            + cfg.meta_beta * float(comp_eff)
+            + cfg.meta_gamma * reasoning
+            + cfg.meta_delta * float(max(0.0, anomaly_delta))
+        )
+        return {"ci_score": ci_score, "structural_score": structural, "reasoning_depth": reasoning, "meta_score": meta}
 
 
 # =====================
@@ -1483,6 +1570,14 @@ class FrontendAI:
                         return s[::-1]
                     """
                 )
+            # If spec indicates MetaLang/AegisLang-like needs, synthesize a simple MetaLang function and transpile
+            if any(ax.startswith("fn ") for ax in axioms):
+                # Create a simple identity MetaLang function as placeholder
+                aegis = "fn aegis_identity(x: int) -> int { return x; }"
+                try:
+                    return MetaLang.to_python(aegis)
+                except Exception:
+                    pass
             # Fallback empty module
             return "\n"
         try:
@@ -1534,6 +1629,16 @@ class FrontendAI:
                 self.ledger.write_artifact("ci_reports", prop.id, prop.ci_report, immutable=True)
             except Exception:
                 pass
+            # Reflection on why selection/changes occurred
+            self.reflect.record(
+                reason="proposal_verification",
+                context={
+                    "proposal": prop.id,
+                    "status": prop.status,
+                    "coverage": prop.ci_report.get("coverage_ratio"),
+                    "exploration_epsilon": self.rsl.exploration_epsilon,
+                },
+            )
             proposals.append(prop)
         return proposals
 
@@ -1579,7 +1684,8 @@ class FrontendAI:
         checks_info = self.checks.strengthen_checks([r.pattern for r in self.kg.all_rules()])
         # Intelligence scoring
         any_ci = next((p.ci_report for p in proposals if p.ci_report), {})
-        intel = IntelligenceScorer.score(any_ci, len(self.kg.all_rules()), self.rsl.last_diversity)
+        comp_eff = float(comp.get("efficiency_score", 0.0))
+        intel = IntelligenceScorer.score(any_ci, len(self.kg.all_rules()), self.rsl.last_diversity, comp_eff, anomaly_delta=0.0, cfg=self.cfg)
         entry = {
             "iteration": 0,
             "top_variants": [{"seed": t["variant"]["seed"], "score": t["sim"]["score"], "axioms": t["variant"]["axioms"]} for t in top],
@@ -1611,7 +1717,11 @@ class FrontendAI:
             comp = self.kg.compress(threshold=self.cfg.compress_threshold, levels=self.cfg.hierarchical_levels)
             checks_info = self.checks.strengthen_checks([r.pattern for r in self.kg.all_rules()])
             any_ci = next((p.ci_report for p in proposals if p.ci_report), {})
-            intel = IntelligenceScorer.score(any_ci, len(self.kg.all_rules()), self.rsl.last_diversity)
+            comp_eff = float(comp.get("efficiency_score", 0.0))
+            # anomaly trend: negative if freeze events increased (rough proxy)
+            anomalies = self.ledger.detect_anomalies()
+            anomaly_delta = -float(len(anomalies))
+            intel = IntelligenceScorer.score(any_ci, len(self.kg.all_rules()), self.rsl.last_diversity, comp_eff, anomaly_delta=anomaly_delta, cfg=self.cfg)
 
             best_score = max((t["sim"]["score"] for t in top), default=0.0)
             if best_score < last_best_score * 0.98:
