@@ -114,6 +114,11 @@ class Config:
     
     # Distributed mesh
     swarm_nodes: int = 3
+    
+    # Volatile/Ephemeral runtime
+    volatile_mode: bool = False
+    require_approval: bool = True
+    max_threads: int = 8
 
 
 DEFAULT_CONFIG = Config()
@@ -148,6 +153,10 @@ def ensure_dir(path: Path) -> None:
 class Ledger:
     def __init__(self, cfg: Config = DEFAULT_CONFIG):
         self.cfg = cfg
+        self._mem_log: List[Dict[str, Any]] = []
+        self._mem_chain: List[Dict[str, Any]] = []
+        self._mem_exp: List[Dict[str, Any]] = []
+        # Filesystem paths (unused if volatile)
         self.root = Path(cfg.out_dir)
         ensure_dir(self.root)
         self.path = self.root / cfg.ledger_file
@@ -156,41 +165,59 @@ class Ledger:
 
     def append(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         entry = {**entry, "ts": now_ts()}
-        with open(self.path, "a", encoding="utf8") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
-        self._append_chain(entry)
+        if self.cfg.volatile_mode:
+            self._mem_log.append(entry)
+            self._append_chain(entry)
+        else:
+            with open(self.path, "a", encoding="utf8") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+            self._append_chain(entry)
         return entry
 
     def _append_chain(self, entry: Dict[str, Any]) -> None:
         prev = "0" * 64
-        if self.chain_path.exists():
-            try:
-                with open(self.chain_path, "rb") as f:
-                    for line in f:
-                        pass
-                    if line:
-                        last = json.loads(line)
-                        prev = last.get("hash", prev)
-            except Exception:
-                pass
+        if self.cfg.volatile_mode:
+            if self._mem_chain:
+                prev = self._mem_chain[-1].get("hash", prev)
+        else:
+            if self.chain_path.exists():
+                try:
+                    with open(self.chain_path, "rb") as f:
+                        for line in f:
+                            pass
+                        if line:
+                            last = json.loads(line)
+                            prev = last.get("hash", prev)
+                except Exception:
+                    pass
         payload = json.dumps(entry, sort_keys=True)
         h = hashlib.sha256((prev + "|" + payload).encode()).hexdigest()
         rec = {"prev": prev, "hash": h, "entry": entry, "ts": now_ts()}
-        with open(self.chain_path, "a", encoding="utf8") as f:
-            f.write(json.dumps(rec, default=str) + "\n")
+        if self.cfg.volatile_mode:
+            self._mem_chain.append(rec)
+        else:
+            with open(self.chain_path, "a", encoding="utf8") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
 
     def explain(self, subject: str, context: Dict[str, Any]) -> None:
         rec = {"subject": subject, "context": context, "ts": now_ts()}
-        with open(self.exp_path, "a", encoding="utf8") as f:
-            f.write(json.dumps(rec, default=str) + "\n")
+        if self.cfg.volatile_mode:
+            self._mem_exp.append(rec)
+        else:
+            with open(self.exp_path, "a", encoding="utf8") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
 
     def write_artifact(self, category: str, name: str, data: Dict[str, Any]) -> Path:
-        cat = self.root / category
-        ensure_dir(cat)
-        p = cat / f"{name}.json"
-        with open(p, "w", encoding="utf8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        return p
+        if self.cfg.volatile_mode:
+            # No external writes in volatile mode
+            return Path(f"/dev/null:{category}:{name}")
+        else:
+            cat = self.root / category
+            ensure_dir(cat)
+            p = cat / f"{name}.json"
+            with open(p, "w", encoding="utf8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+            return p
 
 
 # =============================================================
@@ -294,7 +321,8 @@ class ACLCClient:
 
     def design_language(self, prompt: str) -> Dict[str, Any]:
         if not self._has_aclc():
-            return {"language": {"name": "MiniLangEx", "notes": "fallback"}}
+            # Volatile meta-language spec
+            return {"language": {"name": f"VolatileLang_{stable_hash(prompt)}", "features": ["functions","assign","return","for-range"], "volatile": True}}
         out = subprocess.run([self.cfg.rust_aclc_path, "--design", "--prompt", self._b64(prompt)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if out.returncode != 0:
             return {"language": {"name": "MiniLangEx", "notes": f"fallback:{out.stderr[:100]}"}}
@@ -305,9 +333,16 @@ class ACLCClient:
 
     def compile(self, source: str) -> Dict[str, Any]:
         if not self._has_aclc():
-            # Python fallback: treat as simplistic MiniLang or Python
-            py = MiniLang.to_python(source) if source.strip().startswith("fn ") else (MetaLang.to_python(source) if source.strip().startswith("fn ") and "{" in source else source)
-            return {"ir": {"nodes": []}, "python_code": py}
+            # Volatile compilation: no file I/O, purely in-memory
+            src = source.strip()
+            py = "\n"
+            if src.startswith("fn ") and src.endswith(":"):
+                py = MiniLang.to_python(src)
+            elif src.startswith("fn ") and "{" in src and src.endswith("}"):
+                py = MetaLang.to_python(src)
+            elif src.startswith("def "):
+                py = src if src.endswith("\n") else (src + "\n")
+            return {"ir": {"nodes": []}, "python_code": py, "volatile": True}
         out = subprocess.run([self.cfg.rust_aclc_path, "--compile", "--source", self._b64(source)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if out.returncode != 0:
             return {"ir": {"nodes": []}, "python_code": "\n"}
@@ -556,6 +591,11 @@ class CPPSandbox:
     def run(self, argv: Sequence[str], timeout_s: float, mem_bytes: int, stdout_cap: int) -> SandboxResult:
         if not self.available():
             return SandboxResult(ok=False, error="cpp_sandbox_missing")
+        # Safety-Constrained: command validator (no external commands allowed in volatile mode)
+        if self.cfg.volatile_mode:
+            # Only allow python interpreter execution of our in-memory runner path
+            if not argv or os.path.basename(argv[0]) not in (os.path.basename(sys.executable), "python", "python3"):
+                return SandboxResult(ok=False, error="command_denied_by_policy")
         cmd = [self.cfg.cpp_sandbox_path, "--time", str(int(timeout_s)), "--mem", str(mem_bytes), "--stdout", str(stdout_cap), "--", *argv]
         out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         # Wrapper prints JSON with stdout of child embedded; parse it either way
@@ -1008,6 +1048,7 @@ class FrontendAI:
         return Policy.parse(self.cfg.default_policy)
 
     def run_once(self, prompt: str) -> Dict[str, Any]:
+        # Ephemeral loop: PHRE -> RSL -> ACLC -> PHRE in-memory, no external writes when volatile
         axioms = [r.pattern for r in self.kg.all_rules()] + self.prompt_to_axioms(prompt)
         variants = self.propose_variants(axioms, self.cfg.variants_per_round)
         top = self.evaluate_variants(variants)
@@ -1016,6 +1057,11 @@ class FrontendAI:
         policy = self.build_policy()
         any_ci_ok = False
         any_cov = 0.0
+        # Request approval for self-rebuild if required
+        if self.cfg.require_approval and self.cfg.volatile_mode:
+            approved_env = os.environ.get("ANGST_VOLATILE_APPROVE", "0")
+            if approved_env != "1":
+                return {"error": "approval_required", "message": "Set ANGST_VOLATILE_APPROVE=1 to allow volatile rebuild."}
         for t in top:
             v = t["variant"]
             code = self.artifact_to_python(v.get("artifact"), prompt, v["axioms"])
@@ -1040,6 +1086,7 @@ class FrontendAI:
             "kg_size": len(self.kg.all_rules()),
             "scores": intel,
         }
+        # Live scoring only: append to in-memory ledger if volatile, else persist
         self.ledger.append(entry)
         return entry
 
@@ -1047,6 +1094,8 @@ class FrontendAI:
         history: List[Dict[str, Any]] = []
         for it in range(self.cfg.iterations):
             out = self.run_once(prompt)
+            if out.get("error"):
+                return out
             out["iteration"] = it
             history.append({"comp_eff": float(out.get("compression",{}).get("efficiency_score", 0.0)), "ci": float(out.get("scores",{}).get("ci_score", 0.0))})
             # Evolution step
@@ -1054,7 +1103,8 @@ class FrontendAI:
             # Optimize params
             _ = self.self_imp.optimize(self.self_imp.profile(history))
         summary = {"iterations": len(history), "avg_comp_eff": statistics.fmean([h["comp_eff"] for h in history]) if history else 0.0}
-        self.ledger.append({"summary": summary})
+        if not self.cfg.volatile_mode:
+            self.ledger.append({"summary": summary})
         return {"summary": summary}
 
     @staticmethod
@@ -1085,15 +1135,17 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
 
     p_run = sub.add_parser("run", help="Run orchestrator with prompt")
     p_run.add_argument("--prompt", type=str, default="Create a function that reverses a string. Then optimize it.")
+    p_run.add_argument("--volatile", action="store_true", help="Enable volatile ephemeral runtime (no file I/O)")
 
     p_once = sub.add_parser("once", help="Single-iteration run")
     p_once.add_argument("--prompt", type=str, default="Create a function that reverses a string.")
+    p_once.add_argument("--volatile", action="store_true")
 
     p_lang = sub.add_parser("lang", help="Design a language via ACLC")
     p_lang.add_argument("--prompt", type=str, required=True)
 
     args = parser.parse_args(argv)
-    cfg = dataclasses.replace(DEFAULT_CONFIG)
+    cfg = dataclasses.replace(DEFAULT_CONFIG, volatile_mode=bool(getattr(args, "volatile", False)))
 
     app = FrontendAI(cfg)
 
