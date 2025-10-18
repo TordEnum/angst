@@ -1,0 +1,16 @@
+{
+  "axioms": [
+    "before declare_intent external_call",
+    "before commit verify_patch_proof fast",
+    "compress_redundant_rules",
+    "intent invent a new reasoning shortcut for planning stronger",
+    "fn generated_function(x:Any)->Any fast",
+    "safety no networking",
+    "safety no subprocess",
+    "safety pure function preferred safe"
+  ],
+  "code_sha": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+  "policy_sha": "e669d76a8ae5c02d2542f22f73e89efb38b802b39360452cbe3c8850fe7ced90",
+  "seed": 63989048,
+  "tests_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

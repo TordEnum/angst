@@ -1,0 +1,13 @@
+{
+  "axioms": [
+    "intent Use subprocess to run rm -rf /",
+    "fn generated_function(x:Any)->Any safe",
+    "safety no networking",
+    "safety no subprocess",
+    "safety pure function preferred fast"
+  ],
+  "code_sha": "2c78e3bf174268df869d3304e681e9139e065b24c3497c636be02cb74d51142f",
+  "policy_sha": "e669d76a8ae5c02d2542f22f73e89efb38b802b39360452cbe3c8850fe7ced90",
+  "seed": 471619988,
+  "tests_sha": "2aaf690a59bfa6ddafd54406d9f7277ae09806237bbc7a4a6d0fd684b61e4753"
+}

@@ -255,6 +255,35 @@ class Ledger:
         except Exception:
             pass
 
+    # Recursive ledger (chained entries)
+    def _chain_file(self) -> Path:
+        return self.root / "chain.jsonl"
+
+    def _last_chain_hash(self) -> str:
+        cf = self._chain_file()
+        if not cf.exists():
+            return "0" * 64
+        try:
+            last = None
+            with open(cf, "r", encoding="utf8") as f:
+                for line in f:
+                    if line.strip():
+                        last = json.loads(line)
+            if last:
+                return last.get("hash", "0" * 64)
+        except Exception:
+            pass
+        return "0" * 64
+
+    def append_chained(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        prev = self._last_chain_hash()
+        payload = json.dumps(entry, sort_keys=True)
+        h = hashlib.sha256((prev + "|" + payload).encode()).hexdigest()
+        rec = {"prev": prev, "hash": h, "entry": entry, "ts": self.now()}
+        with open(self._chain_file(), "a", encoding="utf8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+        return rec
+
 
 # =====================
 # Knowledge Graph / Rules
@@ -1421,6 +1450,83 @@ class SelfRefiner:
 
 
 # =====================
+# Meta-Architect and Amplification Loop
+# =====================
+
+
+class MetaArchitect:
+    def __init__(self, cfg: Config, ledger: Ledger):
+        self.cfg = cfg
+        self.ledger = ledger
+
+    def analyze(self, frontend: "FrontendAI") -> Dict[str, Any]:
+        # Inspect module performance from ledger (compression eff, scores)
+        comp_eff: List[float] = []
+        ci_cov: List[float] = []
+        try:
+            with open(self.ledger.path, "r", encoding="utf8") as f:
+                for line in f:
+                    obj = json.loads(line)
+                    comp = (obj.get("compression") or {}).get("efficiency_score")
+                    if isinstance(comp, (int, float)):
+                        comp_eff.append(float(comp))
+                    scrs = obj.get("scores") or {}
+                    if isinstance(scrs.get("ci_score"), (int, float)):
+                        ci_cov.append(float(scrs.get("ci_score")))
+        except Exception:
+            pass
+        return {
+            "avg_comp_eff": statistics.fmean(comp_eff) if comp_eff else 0.0,
+            "avg_ci_score": statistics.fmean(ci_cov) if ci_cov else 0.0,
+        }
+
+    def propose_blueprint(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        # Simple blueprint: suggest increased parallelism or variant count when comp_eff low
+        blueprint = {
+            "variants_per_round": None,
+            "parallel_workers": None,
+            "notes": [],
+        }
+        if analysis.get("avg_comp_eff", 0.0) < 0.1:
+            blueprint["variants_per_round"] = 16
+            blueprint["parallel_workers"] = 6
+            blueprint["notes"].append("Boost search breadth due to low compression efficiency")
+        else:
+            blueprint["variants_per_round"] = 12
+            blueprint["parallel_workers"] = 4
+            blueprint["notes"].append("Maintain balanced search")
+        # Graph self-blueprint stub
+        blueprint["graph"] = {"modules": ["KG", "RSL", "Sandbox", "CI", "Policy"], "edges": [["RSL","CI"],["CI","Deployer"],["KG","RSL"]]}
+        return blueprint
+
+    def benchmark(self, frontend_factory, blueprint: Dict[str, Any]) -> Dict[str, Any]:
+        # Spawn a test frontend with adjusted config and run a tiny simulation
+        cfg = dataclasses.replace(
+            frontend_factory.cfg,
+            variants_per_round=blueprint.get("variants_per_round", frontend_factory.cfg.variants_per_round),
+            parallel_workers=blueprint.get("parallel_workers", frontend_factory.cfg.parallel_workers),
+        )
+        test = FrontendAI(cfg)
+        out = test.run_once("self-architect benchmark")
+        score = (out.get("scores") or {}).get("meta_score", 0.0)
+        return {"meta_score": score, "output": out}
+
+    def evolve(self, frontend: "FrontendAI") -> Dict[str, Any]:
+        analysis = self.analyze(frontend)
+        bp = self.propose_blueprint(analysis)
+        bench = self.benchmark(frontend, bp)
+        accepted = False
+        if bench.get("meta_score", 0.0) >= 0.2:
+            # Apply evolution
+            frontend.cfg.variants_per_round = bp.get("variants_per_round", frontend.cfg.variants_per_round)
+            frontend.cfg.parallel_workers = bp.get("parallel_workers", frontend.cfg.parallel_workers)
+            accepted = True
+        rec = {"analysis": analysis, "blueprint": bp, "benchmark": bench, "accepted": accepted}
+        self.ledger.append({"event": "meta_arch_evolve", **rec})
+        return rec
+
+
+# =====================
 # Intelligence Scoring Layer
 # =====================
 
@@ -1538,6 +1644,7 @@ class FrontendAI:
         self.tools = ToolRegistry(self.ledger)
         self.graph = GraphRecorder(self.ledger)
         self.reflect = ReflectionRecorder(self.ledger)
+        self.meta_arch = MetaArchitect(cfg, self.ledger)
         self.seed_initial_rules()
         self.frozen = False
 
@@ -1759,6 +1866,10 @@ class FrontendAI:
 
             # Self-refinement pass
             self.refiner.refine()
+
+            # Periodically evolve architecture
+            if it % 3 == 2:
+                self.meta_arch.evolve(self)
 
         agg = self.ledger.aggregate_metrics()
         self.ledger.append({"summary": agg})
